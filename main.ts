@@ -1,4 +1,4 @@
-// Cleanest Paper Bot — a conservative momentum / mean-reversion paper trader
+// Cleanest Paper Bot — v2: early-entry + pullback-bounce paper trader
 // for the pump.fun Sharpe Sprint (agent-fun/replay/v2).
 //
 // Self-contained: stdlib only, no network, no model calls, no imports of any
@@ -6,20 +6,33 @@
 //   harness -> bot: {"type":"hello",...} then {"type":"batch",...} then {"type":"done",...}
 //   bot -> harness: one {"type":"reply","seq":n,"orders":[...]} per batch.
 //
-// Strategy (designed for hourly Sharpe, not moonshots):
-//   - Many small, identical stakes (0.03 SOL) spread over many distinct mints.
-//   - Enter only a coin whose price has already risen >= 8% from where we first
-//     saw it, with at least 4 trades behind it and its latest tick not reversing.
-//     One round trip per mint, so the book rotates across >= 20 distinct mints.
-//   - Exit fast: take profit at +25%, stop loss at -12%, trailing exit at -10%
-//     from the peak since entry, and a hard time exit after 2400 slots so dead
-//     coins never sit in the book. At most 5 open positions, mostly in cash.
-//   - Every round trip clears the 0.01 SOL minimum by 3x; fees per round trip
-//     (~0.21m lamports tx fees + ~1.25% curve fees) are small vs the 25%/12%
-//     exit band, so the expectancy hinges on early-momentum continuation,
-//     which is the one edge a bonding curve reliably offers.
-//   - Fully deterministic: every decision is a pure function of the events the
-//     harness has delivered, so two runs on the same window agree exactly.
+// Why v1 lost money (dev grade-local: net PnL -1.11 SOL, win rate 26%):
+//   v1 chased coins already up >= 8% and waited for +25% / -12% exits.
+//   Expectancy was negative before fees: 0.26*25% - 0.74*12% ~= -2.4% per
+//   trade, and ~0.0007 SOL of fees per 0.03 SOL round trip (~2.3%) made it
+//   worse. The loss was expectancy, not size.
+//
+// v2 fixes the expectancy, not the stake (still 0.03 SOL, identical stakes):
+//   - Enter EARLY, not late: buy a fresh coin up only >= 3% from first
+//     sighting (3+ trades, latest tick not down, not yet up more than 15%),
+//     so the entry catches the rise instead of buying its top; OR buy the
+//     bounce: a coin that ran >= 10% then pulled back >= 7% from its peak
+//     and is ticking up again.
+//   - Bank winners sooner and cut losers sooner: take profit +12%, stop
+//     loss -6%, trailing exit -5% from the peak since entry, hard time exit
+//     after 900 slots. With TP/SL = 2:1 the break-even win rate before fees
+//     is 33%; after the ~2.3% fee drag it is ~40% — far below v1's ~39%
+//     break-even at a 26% realised win rate, and early/bounce entries are
+//     the setups most likely to clear it on a bonding curve, where the
+//     first leg up is the most reliable move a fresh coin makes.
+//   - Stay selective: one round trip per mint, at most 5 open positions,
+//     and entries only while the coin is still actively trading (a trade
+//     within the last 300 slots), so dead coins never get bought and fee
+//     drag comes only from live setups.
+//   - Every round trip still clears the 0.01 SOL minimum by 3x; max
+//     drawdown is bounded by the -6% stop on 0.03 SOL stakes.
+//   - Fully deterministic: every decision is a pure function of the events
+//     the harness has delivered, so two runs on the same window agree.
 
 type U64 = string;
 
@@ -33,8 +46,11 @@ interface Curve {
   trades: number;
   complete: boolean;
   firstPrice: number; // SOL per token at first sight
+  firstSlot: number; // slot of first sighting
+  peakPrice: number; // highest price seen since first sighting
   prevPrice: number; // price at the previous observation
   price: number; // latest SOL per token
+  lastTradeSlot: number; // slot of the most recent trade
   seen: boolean;
 }
 
@@ -50,13 +66,23 @@ interface MyPosition {
 const LAMPORTS_PER_SOL = 1_000_000_000n;
 const STAKE_LAMPORTS = 30_000_000n; // 0.03 SOL per buy
 const MIN_STAKE_LAMPORTS = 10_000_000n; // never buy below 0.01 SOL (the round-trip minimum)
-const ENTER_RISE = 1.08; // price must be >= 8% above first sighting
-const MIN_TRADES = 4;
-const TAKE_PROFIT = 1.25; // +25%
-const STOP_LOSS = 0.88; // -12%
-const TRAIL_DROP = 0.9; // -10% from peak since entry
-const MAX_HOLD_SLOTS = 2400;
+// Early-momentum entry: up >= 3% from first sight, not yet up more than 15%.
+const ENTER_RISE = 1.03;
+const ENTER_RISE_MAX = 1.15;
+const MIN_TRADES_EARLY = 3;
+// Pullback-bounce entry: ran >= 10%, pulled back >= 7% from peak, ticking up.
+const BOUNCE_RUN = 1.1;
+const BOUNCE_PULLBACK = 0.93;
+const EPS = 1.002; // tolerance for float boundary comparisons on price ratios
+const MIN_TRADES_BOUNCE = 5;
+// Entries only while the coin is still actively trading.
+const MAX_IDLE_SLOTS = 300;
+const TAKE_PROFIT = 1.12; // +12%
+const STOP_LOSS = 0.94; // -6%
+const TRAIL_DROP = 0.95; // -5% from peak since entry
+const MAX_HOLD_SLOTS = 900;
 const MAX_OPEN = 5;
+const MAX_NEW_BUYS_PER_BATCH = 2; // never fill the whole book in one batch
 const MAX_ORDERS_PER_BATCH = 16;
 const BUY_SLIPPAGE_BPS = 5000;
 const SELL_SLIPPAGE_BPS = 5000;
@@ -103,8 +129,11 @@ function curveFor(mint: string, slot: number): Curve {
       trades: 0,
       complete: false,
       firstPrice: 0,
+      firstSlot: slot,
+      peakPrice: 0,
       prevPrice: 0,
       price: 0,
+      lastTradeSlot: slot,
       seen: false,
     };
     curves.set(mint, c);
@@ -122,10 +151,13 @@ function observeReserves(c: Curve, vt: bigint, vq: bigint, realQ: bigint, slot: 
   if (p > 0) {
     if (!c.seen) {
       c.firstPrice = p;
+      c.firstSlot = slot;
       c.prevPrice = p;
+      c.peakPrice = p;
       c.seen = true;
     } else {
       c.prevPrice = c.price;
+      if (p > c.peakPrice) c.peakPrice = p;
     }
     c.price = p;
   }
@@ -209,6 +241,7 @@ function onBatch(batch: any): Order[] {
       const c = curveFor(e.mint, e.slot);
       observeReserves(c, BigInt(e.virtual_token_reserves), BigInt(e.virtual_sol_reserves), BigInt(e.real_sol_reserves), e.slot);
       c.trades += 1;
+      c.lastTradeSlot = e.slot;
     } else if (e.event === 'CompleteEvent') {
       const c = curveFor(e.mint, e.slot);
       c.complete = true;
@@ -245,19 +278,30 @@ function onBatch(batch: any): Order[] {
     }
   }
 
-  // 5. Entries: early-momentum coins, one small stake each, rotating slots.
+  // 5. Entries: early momentum or pullback bounce, one small stake each.
   const openCount =
     myPositions.size + [...pendingBuy.keys()].filter((m) => !myPositions.has(m)).length;
   let slotsLeft = Math.max(0, maxOpenPositions - openCount);
+  let buysThisBatch = 0;
   if (slotsLeft > 0) {
     for (const c of curves.values()) {
-      if (slotsLeft <= 0 || orders.length >= MAX_ORDERS_PER_BATCH) break;
+      if (slotsLeft <= 0 || buysThisBatch >= MAX_NEW_BUYS_PER_BATCH || orders.length >= MAX_ORDERS_PER_BATCH) break;
       if (c.complete || !c.seen || c.price <= 0) continue;
       if (myPositions.has(c.mint) || pendingBuy.has(c.mint) || traded.has(c.mint)) continue;
-      if (c.trades < MIN_TRADES) continue;
-      // Momentum: up >= 8% from first sighting and the latest tick not down.
-      if (c.price < c.firstPrice * ENTER_RISE) continue;
+      // Only actively trading coins: no stale entries on dead curves.
+      if (slot - c.lastTradeSlot > MAX_IDLE_SLOTS) continue;
+      // Latest tick must not be falling into the entry.
       if (c.price < c.prevPrice) continue;
+      const early =
+        c.trades >= MIN_TRADES_EARLY &&
+        c.price >= c.firstPrice * ENTER_RISE &&
+        c.price <= c.firstPrice * ENTER_RISE_MAX;
+      const bounce =
+        c.trades >= MIN_TRADES_BOUNCE &&
+        c.peakPrice >= c.firstPrice * BOUNCE_RUN &&
+        c.price <= c.peakPrice * BOUNCE_PULLBACK * EPS &&
+        c.price >= c.firstPrice; // still above launch: no dead-coin floor bounce
+      if (!early && !bounce) continue;
       // Size cap: at most maxOrderBps of the real SOL reserve this reply.
       const cap = (c.realQ * BigInt(maxOrderBps)) / 10_000n;
       if (cap < MIN_STAKE_LAMPORTS) continue;
@@ -274,6 +318,7 @@ function onBatch(batch: any): Order[] {
       pendingBuy.set(c.mint, stake);
       freeCash -= stake + txFeeLamports;
       slotsLeft -= 1;
+      buysThisBatch += 1;
     }
   }
 
